@@ -1,0 +1,8 @@
+# requeriments
+pip install discord.py watchdog psutil
+pip install -U discord.py
+# Instalar pacotes Python necessários
+pip install discord.py watchdog psutil
+
+# Confirmar versão Python (opcional)
+python --version
